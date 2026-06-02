@@ -131,13 +131,12 @@ jobs:
       - name: Install rootfs tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq mmdebstrap
+          sudo apt-get install -y -qq debootstrap debian-archive-keyring
 
       - name: Create Debian rootfs
         run: |
           ROOTFS="$(pwd)/rootfs"
-          # Use sudo on GitHub Actions (runners have root)
-          sudo mmdebstrap --variant=minbase \
+          sudo debootstrap --variant=minbase \
             --include="iproute2,iputils-ping,net-tools,procps,psmisc,vim-tiny,less,ca-certificates,curl,wget,iperf3,kmod" \
             "${{ env.DEBIAN_RELEASE }}" "$ROOTFS" \
             http://deb.debian.org/debian
