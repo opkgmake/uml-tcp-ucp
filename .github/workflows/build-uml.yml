@@ -136,7 +136,8 @@ jobs:
       - name: Create Debian rootfs
         run: |
           ROOTFS="$(pwd)/rootfs"
-          mmdebstrap --variant=minbase \
+          # Use sudo on GitHub Actions (runners have root)
+          sudo mmdebstrap --variant=minbase \
             --include="iproute2,iputils-ping,net-tools,procps,psmisc,vim-tiny,less,ca-certificates,curl,wget,iperf3,kmod" \
             "${{ env.DEBIAN_RELEASE }}" "$ROOTFS" \
             http://deb.debian.org/debian

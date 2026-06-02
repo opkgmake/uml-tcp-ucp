@@ -5,7 +5,7 @@
 # ============================================================================
 set -euo pipefail
 
-REPO="opkgmake/uml-tcp-ucp"          # Change to your repo
+REPO="opkgmake/uml-tcp-ucp"
 BRANCH="main"
 ARTIFACT_NAME="uml-tcp-ucp-package"
 PKG_DIR="$(cd "$(dirname "$0")" && pwd)"
