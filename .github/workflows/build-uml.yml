@@ -22,104 +22,7 @@ env:
 
 jobs:
   # ========================================================================
-  # Build UML kernel + tcp_ucp module (single job, share kernel tree)
-  # ========================================================================
-  build-kernel-module:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential libncurses-dev flex bison bc libelf-dev
-
-      - name: Cache kernel source
-        id: cache-kernel-src
-        uses: actions/cache@v4
-        with:
-          path: linux-${{ env.KERNEL_VERSION }}.tar.xz
-          key: kernel-tarball-${{ env.KERNEL_VERSION }}
-
-      - name: Download kernel source
-        if: steps.cache-kernel-src.outputs.cache-hit != 'true'
-        run: |
-          # Determine URL path: v6.x for 6.x kernels
-          KVER="${{ env.KERNEL_VERSION }}"
-          MAJOR="${KVER%%.*}"
-          wget -q --show-progress -O "linux-${KVER}.tar.xz" \
-            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KVER}.tar.xz"
-
-      - name: Extract and prepare kernel
-        run: |
-          KVER="${{ env.KERNEL_VERSION }}"
-          tar xf "linux-${KVER}.tar.xz"
-          cd "linux-${KVER}"
-
-          make mrproper ARCH=um 2>/dev/null || true
-          make defconfig ARCH=um SUBARCH=x86_64
-
-          cat >> .config <<'EOF'
-          CONFIG_GDB_SCRIPTS=y
-          CONFIG_HOSTFS=y
-          CONFIG_MAGIC_SYSRQ=y
-          CONFIG_MODULES=y
-          CONFIG_INET=y
-          CONFIG_NET=y
-          CONFIG_TCP_CONG_ADVANCED=y
-          CONFIG_TCP_CONG_BBR=m
-          CONFIG_TCP_CONG_CUBIC=y
-          CONFIG_MODULE_SIG=n
-          CONFIG_MODULE_SIG_FORCE=n
-          CONFIG_DEBUG_INFO=y
-          CONFIG_DEBUG_INFO_DWARF4=y
-          EOF
-
-          make olddefconfig ARCH=um SUBARCH=x86_64
-
-      - name: Cache kernel build
-        uses: actions/cache@v4
-        with:
-          path: linux-${{ env.KERNEL_VERSION }}/{arch/um,net,include,scripts,Module.symvers,modules.builtin,modules.order,.config,vmlinux,linux}
-          key: kernel-uml-build-${{ env.KERNEL_VERSION }}-${{ hashFiles('.github/workflows/build-uml.yml') }}
-          restore-keys: |
-            kernel-uml-build-${{ env.KERNEL_VERSION }}-
-
-      - name: Build UML kernel + modules
-        run: |
-          KVER="${{ env.KERNEL_VERSION }}"
-          cd "linux-${KVER}"
-          make linux ARCH=um SUBARCH=x86_64 -j$(nproc)
-          make vmlinux ARCH=um SUBARCH=x86_64 -j$(nproc) 2>/dev/null || true
-          make modules ARCH=um SUBARCH=x86_64 -j$(nproc)
-          make scripts_gdb ARCH=um 2>/dev/null || true
-
-      - name: Build tcp_ucp module
-        run: |
-          KVER="${{ env.KERNEL_VERSION }}"
-          KSRC="$(pwd)/linux-${KVER}"
-
-          git clone --depth 1 https://github.com/liulilittle/tcp_ucp.git tcp_ucp-src
-          cd tcp_ucp-src
-          make KERNELDIR="$KSRC" ARCH=um
-          file tcp_ucp.ko
-
-      - name: Upload kernel + module
-        uses: actions/upload-artifact@v4
-        with:
-          name: uml-kernel-and-module
-          path: |
-            linux-${{ env.KERNEL_VERSION }}/linux
-            linux-${{ env.KERNEL_VERSION }}/vmlinux
-            linux-${{ env.KERNEL_VERSION }}/.config
-            linux-${{ env.KERNEL_VERSION }}/scripts/gdb/
-            tcp_ucp-src/tcp_ucp.ko
-          retention-days: 30
-
-  # ========================================================================
-  # Build Debian rootfs (parallel with kernel build)
+  # Job 1: Build rootfs FIRST (fail-fast: if rootfs fails, skip kernel)
   # ========================================================================
   build-rootfs:
     runs-on: ubuntu-24.04
@@ -128,18 +31,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install rootfs tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq debootstrap debian-archive-keyring
-
-      - name: Create Debian rootfs
+      - name: Build rootfs via Docker export
         run: |
           ROOTFS="$(pwd)/rootfs"
-          sudo debootstrap --variant=minbase \
-            --include="iproute2,iputils-ping,net-tools,procps,psmisc,vim-tiny,less,ca-certificates,curl,wget,iperf3,kmod" \
-            "${{ env.DEBIAN_RELEASE }}" "$ROOTFS" \
-            http://deb.debian.org/debian
+
+          # Use Docker to create a Debian bookworm rootfs
+          # This avoids GPG key issues with mmdebstrap/debootstrap on GA runners
+          docker pull debian:${{ env.DEBIAN_RELEASE }}
+
+          CID=$(docker create debian:${{ env.DEBIAN_RELEASE }} /bin/true)
+
+          # Install packages inside the container
+          docker start -ai "$CID" /bin/sh -c '
+            apt-get update -qq &&
+            apt-get install -y -qq --no-install-recommends \
+              iproute2 iputils-ping net-tools procps psmisc \
+              vim-tiny less ca-certificates curl wget iperf3 kmod \
+              init systemd-sysv 2>/dev/null || \
+            apt-get install -y -qq --no-install-recommends \
+              iproute2 iputils-ping net-tools procps psmisc \
+              vim-tiny less ca-certificates curl wget iperf3 kmod
+          '
+
+          # Export container filesystem as tar
+          docker export "$CID" | tar -x -C "$ROOTFS"
+          docker rm "$CID"
+
+      - name: Install tini and configure rootfs
+        run: |
+          ROOTFS="$(pwd)/rootfs"
 
           # Install tini
           wget -q -O "$ROOTFS/sbin/tini" \
@@ -147,7 +67,7 @@ jobs:
           chmod +x "$ROOTFS/sbin/tini"
 
           # Ensure dirs
-          mkdir -p "$ROOTFS"/{tmp,root,var/run,etc/sysctl.d,lib/modules,dev/pts,dev/shm,run,proc,sys}
+          sudo mkdir -p "$ROOTFS"/{tmp,root,var/run,etc/sysctl.d,lib/modules,dev/pts,dev/shm,run,proc,sys}
 
           # Init script
           cat > "$ROOTFS/init.sh" << 'INITEOF'
@@ -230,7 +150,104 @@ jobs:
           retention-days: 30
 
   # ========================================================================
-  # Assemble final package
+  # Job 2: Build UML kernel + tcp_ucp (ONLY after rootfs succeeds)
+  # ========================================================================
+  build-kernel-module:
+    runs-on: ubuntu-24.04
+    needs: build-rootfs
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libncurses-dev flex bison bc libelf-dev
+
+      - name: Cache kernel source
+        id: cache-kernel-src
+        uses: actions/cache@v4
+        with:
+          path: linux-${{ env.KERNEL_VERSION }}.tar.xz
+          key: kernel-tarball-${{ env.KERNEL_VERSION }}
+
+      - name: Download kernel source
+        if: steps.cache-kernel-src.outputs.cache-hit != 'true'
+        run: |
+          KVER="${{ env.KERNEL_VERSION }}"
+          MAJOR="${KVER%%.*}"
+          wget -q --show-progress -O "linux-${KVER}.tar.xz" \
+            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KVER}.tar.xz"
+
+      - name: Extract and prepare kernel
+        run: |
+          KVER="${{ env.KERNEL_VERSION }}"
+          tar xf "linux-${KVER}.tar.xz"
+          cd "linux-${KVER}"
+
+          make mrproper ARCH=um 2>/dev/null || true
+          make defconfig ARCH=um SUBARCH=x86_64
+
+          cat >> .config <<'EOF'
+          CONFIG_GDB_SCRIPTS=y
+          CONFIG_HOSTFS=y
+          CONFIG_MAGIC_SYSRQ=y
+          CONFIG_MODULES=y
+          CONFIG_INET=y
+          CONFIG_NET=y
+          CONFIG_TCP_CONG_ADVANCED=y
+          CONFIG_TCP_CONG_BBR=m
+          CONFIG_TCP_CONG_CUBIC=y
+          CONFIG_MODULE_SIG=n
+          CONFIG_MODULE_SIG_FORCE=n
+          CONFIG_DEBUG_INFO=y
+          CONFIG_DEBUG_INFO_DWARF4=y
+          EOF
+
+          make olddefconfig ARCH=um SUBARCH=x86_64
+
+      - name: Cache kernel build
+        uses: actions/cache@v4
+        with:
+          path: linux-${{ env.KERNEL_VERSION }}/{arch/um,net,include,scripts,Module.symvers,modules.builtin,modules.order,.config,vmlinux,linux}
+          key: kernel-uml-build-${{ env.KERNEL_VERSION }}-${{ hashFiles('.github/workflows/build-uml.yml') }}
+          restore-keys: |
+            kernel-uml-build-${{ env.KERNEL_VERSION }}-
+
+      - name: Build UML kernel + modules
+        run: |
+          KVER="${{ env.KERNEL_VERSION }}"
+          cd "linux-${KVER}"
+          make linux ARCH=um SUBARCH=x86_64 -j$(nproc)
+          make vmlinux ARCH=um SUBARCH=x86_64 -j$(nproc) 2>/dev/null || true
+          make modules ARCH=um SUBARCH=x86_64 -j$(nproc)
+          make scripts_gdb ARCH=um 2>/dev/null || true
+
+      - name: Build tcp_ucp module
+        run: |
+          KVER="${{ env.KERNEL_VERSION }}"
+          KSRC="$(pwd)/linux-${KVER}"
+
+          git clone --depth 1 https://github.com/liulilittle/tcp_ucp.git tcp_ucp-src
+          cd tcp_ucp-src
+          make KERNELDIR="$KSRC" ARCH=um
+          file tcp_ucp.ko
+
+      - name: Upload kernel + module
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-kernel-and-module
+          path: |
+            linux-${{ env.KERNEL_VERSION }}/linux
+            linux-${{ env.KERNEL_VERSION }}/vmlinux
+            linux-${{ env.KERNEL_VERSION }}/.config
+            linux-${{ env.KERNEL_VERSION }}/scripts/gdb/
+            tcp_ucp-src/tcp_ucp.ko
+          retention-days: 30
+
+  # ========================================================================
+  # Job 3: Assemble final package
   # ========================================================================
   package:
     runs-on: ubuntu-24.04
@@ -257,7 +274,7 @@ jobs:
           # tcp_ucp module → rootfs
           cp artifacts/uml-kernel-and-module/tcp_ucp.ko pkg/rootfs/lib/modules/
 
-          # GDB scripts (for lx-* commands)
+          # GDB scripts
           mkdir -p pkg/scripts
           cp -r artifacts/uml-kernel-and-module/scripts/gdb pkg/scripts/ 2>/dev/null || true
           cp artifacts/uml-kernel-and-module/.config pkg/.config 2>/dev/null || true
