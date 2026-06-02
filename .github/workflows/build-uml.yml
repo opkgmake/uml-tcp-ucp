@@ -31,7 +31,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build rootfs via Docker export
+      - name: Build rootfs via Docker
         run: |
           ROOTFS="$(pwd)/rootfs"
 
@@ -39,23 +39,18 @@ jobs:
           # This avoids GPG key issues with mmdebstrap/debootstrap on GA runners
           docker pull debian:${{ env.DEBIAN_RELEASE }}
 
-          CID=$(docker create debian:${{ env.DEBIAN_RELEASE }} /bin/true)
-
-          # Install packages inside the container
-          docker start -ai "$CID" /bin/sh -c '
+          # Run apt-get inside container, then export the filesystem
+          docker run --name=uml-rootfs debian:${{ env.DEBIAN_RELEASE }} /bin/sh -c '
             apt-get update -qq &&
-            apt-get install -y -qq --no-install-recommends \
-              iproute2 iputils-ping net-tools procps psmisc \
-              vim-tiny less ca-certificates curl wget iperf3 kmod \
-              init systemd-sysv 2>/dev/null || \
             apt-get install -y -qq --no-install-recommends \
               iproute2 iputils-ping net-tools procps psmisc \
               vim-tiny less ca-certificates curl wget iperf3 kmod
           '
 
           # Export container filesystem as tar
-          docker export "$CID" | tar -x -C "$ROOTFS"
-          docker rm "$CID"
+          mkdir -p "$ROOTFS"
+          docker export uml-rootfs | tar -x -C "$ROOTFS"
+          docker rm uml-rootfs
 
       - name: Install tini and configure rootfs
         run: |
