@@ -257,22 +257,26 @@ jobs:
         with:
           path: artifacts
 
+      - name: Inspect artifact structure
+        run: find artifacts -type f | head -30
+
       - name: Assemble
         run: |
           mkdir -p pkg/rootfs/lib/modules
+          KVER="${{ env.KERNEL_VERSION }}"
 
-          # Kernel
-          cp artifacts/uml-kernel-and-module/linux pkg/
-          cp artifacts/uml-kernel-and-module/vmlinux pkg/
+          # Kernel (artifact preserves directory structure from workspace root)
+          cp "artifacts/uml-kernel-and-module/linux-${KVER}/linux" pkg/
+          cp "artifacts/uml-kernel-and-module/linux-${KVER}/vmlinux" pkg/ 2>/dev/null || true
           chmod +x pkg/linux
 
           # tcp_ucp module → rootfs
-          cp artifacts/uml-kernel-and-module/tcp_ucp.ko pkg/rootfs/lib/modules/
+          cp "artifacts/uml-kernel-and-module/tcp_ucp-src/tcp_ucp.ko" pkg/rootfs/lib/modules/
 
           # GDB scripts
           mkdir -p pkg/scripts
-          cp -r artifacts/uml-kernel-and-module/scripts/gdb pkg/scripts/ 2>/dev/null || true
-          cp artifacts/uml-kernel-and-module/.config pkg/.config 2>/dev/null || true
+          cp -r "artifacts/uml-kernel-and-module/linux-${KVER}/scripts/gdb" pkg/scripts/ 2>/dev/null || true
+          cp "artifacts/uml-kernel-and-module/linux-${KVER}/.config" pkg/.config 2>/dev/null || true
 
           # Rootfs
           tar xf artifacts/uml-rootfs/rootfs.tar.zst -C pkg/rootfs
