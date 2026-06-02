@@ -262,15 +262,19 @@ jobs:
 
       - name: Assemble
         run: |
-          mkdir -p pkg/rootfs/lib/modules
           KVER="${{ env.KERNEL_VERSION }}"
+
+          # Extract rootfs FIRST (it contains ./lib → usr/lib symlink)
+          mkdir -p pkg/rootfs
+          tar xf artifacts/uml-rootfs/rootfs.tar.zst -C pkg/rootfs
 
           # Kernel (artifact preserves directory structure from workspace root)
           cp "artifacts/uml-kernel-and-module/linux-${KVER}/linux" pkg/
           cp "artifacts/uml-kernel-and-module/linux-${KVER}/vmlinux" pkg/ 2>/dev/null || true
           chmod +x pkg/linux
 
-          # tcp_ucp module → rootfs
+          # tcp_ucp module → rootfs (after extraction, lib/modules may need creating)
+          mkdir -p pkg/rootfs/lib/modules
           cp "artifacts/uml-kernel-and-module/tcp_ucp-src/tcp_ucp.ko" pkg/rootfs/lib/modules/
 
           # GDB scripts
