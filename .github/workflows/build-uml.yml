@@ -1,0 +1,356 @@
+name: Build UML + tcp_ucp
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Linux kernel version'
+        required: false
+        default: '6.6.89'
+      debian_release:
+        description: 'Debian release codename'
+        required: false
+        default: 'bookworm'
+
+env:
+  KERNEL_VERSION: ${{ github.event.inputs.kernel_version || '6.6.89' }}
+  DEBIAN_RELEASE: ${{ github.event.inputs.debian_release || 'bookworm' }}
+
+jobs:
+  # ========================================================================
+  # Build UML kernel + tcp_ucp module (single job, share kernel tree)
+  # ========================================================================
+  build-kernel-module:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libncurses-dev flex bison bc libelf-dev
+
+      - name: Cache kernel source
+        id: cache-kernel-src
+        uses: actions/cache@v4
+        with:
+          path: linux-${{ env.KERNEL_VERSION }}.tar.xz
+          key: kernel-tarball-${{ env.KERNEL_VERSION }}
+
+      - name: Download kernel source
+        if: steps.cache-kernel-src.outputs.cache-hit != 'true'
+        run: |
+          # Determine URL path: v6.x for 6.x kernels
+          KVER="${{ env.KERNEL_VERSION }}"
+          MAJOR="${KVER%%.*}"
+          wget -q --show-progress -O "linux-${KVER}.tar.xz" \
+            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KVER}.tar.xz"
+
+      - name: Extract and prepare kernel
+        run: |
+          KVER="${{ env.KERNEL_VERSION }}"
+          tar xf "linux-${KVER}.tar.xz"
+          cd "linux-${KVER}"
+
+          make mrproper ARCH=um 2>/dev/null || true
+          make defconfig ARCH=um SUBARCH=x86_64
+
+          cat >> .config <<'EOF'
+          CONFIG_GDB_SCRIPTS=y
+          CONFIG_HOSTFS=y
+          CONFIG_MAGIC_SYSRQ=y
+          CONFIG_MODULES=y
+          CONFIG_INET=y
+          CONFIG_NET=y
+          CONFIG_TCP_CONG_ADVANCED=y
+          CONFIG_TCP_CONG_BBR=m
+          CONFIG_TCP_CONG_CUBIC=y
+          CONFIG_MODULE_SIG=n
+          CONFIG_MODULE_SIG_FORCE=n
+          CONFIG_DEBUG_INFO=y
+          CONFIG_DEBUG_INFO_DWARF4=y
+          EOF
+
+          make olddefconfig ARCH=um SUBARCH=x86_64
+
+      - name: Cache kernel build
+        uses: actions/cache@v4
+        with:
+          path: linux-${{ env.KERNEL_VERSION }}/{arch/um,net,include,scripts,Module.symvers,modules.builtin,modules.order,.config,vmlinux,linux}
+          key: kernel-uml-build-${{ env.KERNEL_VERSION }}-${{ hashFiles('.github/workflows/build-uml.yml') }}
+          restore-keys: |
+            kernel-uml-build-${{ env.KERNEL_VERSION }}-
+
+      - name: Build UML kernel + modules
+        run: |
+          KVER="${{ env.KERNEL_VERSION }}"
+          cd "linux-${KVER}"
+          make linux ARCH=um SUBARCH=x86_64 -j$(nproc)
+          make vmlinux ARCH=um SUBARCH=x86_64 -j$(nproc) 2>/dev/null || true
+          make modules ARCH=um SUBARCH=x86_64 -j$(nproc)
+          make scripts_gdb ARCH=um 2>/dev/null || true
+
+      - name: Build tcp_ucp module
+        run: |
+          KVER="${{ env.KERNEL_VERSION }}"
+          KSRC="$(pwd)/linux-${KVER}"
+
+          git clone --depth 1 https://github.com/liulilittle/tcp_ucp.git tcp_ucp-src
+          cd tcp_ucp-src
+          make KERNELDIR="$KSRC" ARCH=um
+          file tcp_ucp.ko
+
+      - name: Upload kernel + module
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-kernel-and-module
+          path: |
+            linux-${{ env.KERNEL_VERSION }}/linux
+            linux-${{ env.KERNEL_VERSION }}/vmlinux
+            linux-${{ env.KERNEL_VERSION }}/.config
+            linux-${{ env.KERNEL_VERSION }}/scripts/gdb/
+            tcp_ucp-src/tcp_ucp.ko
+          retention-days: 30
+
+  # ========================================================================
+  # Build Debian rootfs (parallel with kernel build)
+  # ========================================================================
+  build-rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rootfs tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mmdebstrap
+
+      - name: Create Debian rootfs
+        run: |
+          ROOTFS="$(pwd)/rootfs"
+          mmdebstrap --variant=minbase \
+            --include="iproute2,iputils-ping,net-tools,procps,psmisc,vim-tiny,less,ca-certificates,curl,wget,iperf3,kmod" \
+            "${{ env.DEBIAN_RELEASE }}" "$ROOTFS" \
+            http://deb.debian.org/debian
+
+          # Install tini
+          wget -q -O "$ROOTFS/sbin/tini" \
+            https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-amd64
+          chmod +x "$ROOTFS/sbin/tini"
+
+          # Ensure dirs
+          mkdir -p "$ROOTFS"/{tmp,root,var/run,etc/sysctl.d,lib/modules,dev/pts,dev/shm,run,proc,sys}
+
+          # Init script
+          cat > "$ROOTFS/init.sh" << 'INITEOF'
+          #!/bin/sh
+          mount -t proc proc /proc
+          mount -t sysfs sys /sys
+          mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+          mkdir -p /dev/pts /dev/shm
+          mount -t devpts devpts /dev/pts 2>/dev/null || true
+          mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
+          mount -t tmpfs tmpfs /run 2>/dev/null || true
+
+          hostname uml-ucp
+          echo "uml-ucp" > /etc/hostname
+          echo "127.0.0.1 localhost uml-ucp" > /etc/hosts
+
+          # Load tcp_ucp
+          for ko in /lib/modules/tcp_ucp.ko /tcp_ucp.ko; do
+              [ -f "$ko" ] && insmod "$ko" && echo "[OK] tcp_ucp loaded" && break
+          done
+          if ! grep -q ucp /proc/modules 2>/dev/null; then
+              depmod -a 2>/dev/null; modprobe tcp_ucp 2>/dev/null
+          fi
+
+          # Set default CC
+          if [ -f /proc/sys/net/ipv4/tcp_congestion_control ]; then
+              echo ucp > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null \
+                  && echo "[OK] CC = ucp" || echo "[WARN] CC = $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+          fi
+
+          cat > /etc/sysctl.d/99-tcp-ucp.conf << 'SYSEOF'
+          net.ipv4.tcp_congestion_control = ucp
+          net.ipv4.tcp_allowed_congestion_control = ucp bbr cubic reno
+          SYSEOF
+          sysctl -p /etc/sysctl.d/99-tcp-ucp.conf 2>/dev/null || true
+
+          # Network
+          ip link set lo up 2>/dev/null || true
+          if [ -d /sys/class/net/eth0 ]; then
+              ip link set eth0 up
+              ip address add 10.0.2.15/24 dev eth0 2>/dev/null || true
+              ip route add default via 10.0.2.2 2>/dev/null || true
+              echo "nameserver 10.0.2.3" > /etc/resolv.conf
+              echo "[OK] Network: 10.0.2.15/24 gw 10.0.2.2"
+          else
+              echo "[INFO] No eth0 - loopback only (install slirp on host for network)"
+          fi
+
+          echo "============================================"
+          echo "  UML + tcp_ucp  Kernel: $(uname -r)"
+          echo "  CC: $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+          echo "============================================"
+          export PS1='\[\033[01;32m\]UML-UCP:\w\[\033[00m\]\$ '
+          exec /sbin/tini /bin/sh +m
+          INITEOF
+          chmod +x "$ROOTFS/init.sh"
+
+          # Test script
+          cat > "$ROOTFS/test-ucp.sh" << 'EOF'
+          #!/bin/sh
+          echo "=== tcp_ucp Test ==="
+          echo "[1] CC:       $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+          echo "[2] Available:$(cat /proc/sys/net/ipv4/tcp_available_congestion_control)"
+          echo "[3] Modules:"; lsmod | head -5
+          echo "[4] Network:"; ip addr show 2>/dev/null | grep -E "inet |link/"
+          echo "[5] Parameters:"; ls /sys/module/tcp_ucp/parameters/ 2>/dev/null | head -5
+          command -v iperf3 >/dev/null && echo "[6] iperf3: iperf3 -c <host> -C ucp"
+          echo "=== Done ==="
+          EOF
+          chmod +x "$ROOTFS/test-ucp.sh"
+
+      - name: Package rootfs
+        run: tar caf rootfs.tar.zst -C rootfs .
+
+      - name: Upload rootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-rootfs
+          path: rootfs.tar.zst
+          retention-days: 30
+
+  # ========================================================================
+  # Assemble final package
+  # ========================================================================
+  package:
+    runs-on: ubuntu-24.04
+    needs: [build-kernel-module, build-rootfs]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble
+        run: |
+          mkdir -p pkg/rootfs/lib/modules
+
+          # Kernel
+          cp artifacts/uml-kernel-and-module/linux pkg/
+          cp artifacts/uml-kernel-and-module/vmlinux pkg/
+          chmod +x pkg/linux
+
+          # tcp_ucp module → rootfs
+          cp artifacts/uml-kernel-and-module/tcp_ucp.ko pkg/rootfs/lib/modules/
+
+          # GDB scripts (for lx-* commands)
+          mkdir -p pkg/scripts
+          cp -r artifacts/uml-kernel-and-module/scripts/gdb pkg/scripts/ 2>/dev/null || true
+          cp artifacts/uml-kernel-and-module/.config pkg/.config 2>/dev/null || true
+
+          # Rootfs
+          tar xf artifacts/uml-rootfs/rootfs.tar.zst -C pkg/rootfs
+
+          # Startup script
+          cat > pkg/UML.sh << 'SCRIPT'
+          #!/bin/sh
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          SLIRP=""
+          command -v slirp-fullbolt >/dev/null 2>&1 && SLIRP="eth0=slirp,,/usr/bin/slirp-fullbolt"
+          command -v slirp >/dev/null 2>&1 && SLIRP="eth0=slirp,,/usr/bin/slirp"
+
+          "$SCRIPT_DIR/linux" \
+              umid=uml0 hostname=uml-ucp $SLIRP \
+              root=/dev/root rootfstype=hostfs rootflags="$SCRIPT_DIR/rootfs" \
+              rw mem=256M init=/init.sh quiet "$@"
+          stty sane; echo
+          SCRIPT
+          chmod +x pkg/UML.sh
+
+          # GDB script
+          cat > pkg/UML-gdb.sh << 'GDBSCRIPT'
+          #!/bin/sh
+          SD="$(cd "$(dirname "$0")" && pwd)"
+          cat > "$SD/.gdbinit" << EOF2
+          add-auto-load-safe-path $SD/scripts/gdb/vmlinux-gdb.py
+          file $SD/vmlinux
+          set args umid=uml0 root=/dev/root rootfstype=hostfs rootflags=$SD/rootfs rw mem=256M init=/init.sh quiet
+          handle SIGSEGV nostop noprint
+          handle SIGUSR1 nopass stop print
+          EOF2
+          echo "GDB starting. Type 'run' to launch UML."
+          echo "Break: pkill -SIGUSR1 -f 'vmlinux umid=uml0'"
+          gdb -q -x "$SD/.gdbinit"
+          GDBSCRIPT
+          chmod +x pkg/UML-gdb.sh
+
+          # README
+          cat > pkg/README.md << 'README'
+          # UML + tcp_ucp
+          ## Quick Start
+          ```bash
+          chmod +x UML.sh
+          ./UML.sh
+          ```
+          ## Inside UML
+          ```bash
+          cat /proc/sys/net/ipv4/tcp_congestion_control  # should be "ucp"
+          /test-ucp.sh
+          ```
+          ## GDB
+          ```bash
+          ./UML-gdb.sh
+          ```
+          ## Change CC
+          ```bash
+          echo cubic > /proc/sys/net/ipv4/tcp_congestion_control
+          echo ucp   > /proc/sys/net/ipv4/tcp_congestion_control
+          ```
+          README
+
+          tar caf uml-tcp-ucp.tar.zst -C pkg .
+          echo "=== Package contents ==="
+          tar tf uml-tcp-ucp.tar.zst | head -20
+          echo "..."
+          echo "=== Size ==="
+          ls -lh uml-tcp-ucp.tar.zst
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: uml-tcp-ucp-package
+          path: uml-tcp-ucp.tar.zst
+          retention-days: 90
+
+      - name: Summary
+        run: |
+          SIZE=$(ls -lh uml-tcp-ucp.tar.zst | awk '{print $5}')
+          echo "## Build Complete ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Kernel | Linux ${{ env.KERNEL_VERSION }} (UML x86_64) |" >> $GITHUB_STEP_SUMMARY
+          echo "| CC | tcp_ucp (Kalman-augmented BBRv1) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rootfs | Debian ${{ env.DEBIAN_RELEASE }} + tini |" >> $GITHUB_STEP_SUMMARY
+          echo "| Network | slirp (userspace, no root) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | ${SIZE} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Run on any amd64 Linux (no root):" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "tar xf uml-tcp-ucp.tar.zst" >> $GITHUB_STEP_SUMMARY
+          echo "./UML.sh" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
